@@ -20,10 +20,10 @@ side chat，第一条消息也在这个新 side chat 里回复。也可以保持
 
 ## 安装与卸载：对 Muse 说一句话
 
-把下面这句话发给 Muse（换成实际的仓库地址），它会按仓库里的 `AGENTS.md` 完成安装：
+把下面这句话发给 Muse，它会按仓库里的 `AGENTS.md` 完成安装：
 
 ```
-帮我安装 muse-stoat-bridge，把 Stoat 接入你：<仓库地址>
+帮我安装 muse-stoat-bridge，仓库地址：https://github.com/GasTest123/muse-stoat-bridge
 ```
 
 卸载也只需要一句：
