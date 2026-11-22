@@ -8,12 +8,10 @@
 # poll interval. All decisions (single-instance lock, worker lease, wake
 # cooldown, bridge-down alerts, dry-run purity) live in `stoatctl.py hook-poll`.
 #
-# Multi-channel: with a routes.json, register one hook per route (each
-# delivering to its own Muse side chat). `stoatctl routes hooks --write`
-# generates per-route wrappers that set STOAT_ROUTE and source this script;
-# without STOAT_ROUTE this script serves every channel (single side chat).
-# With auto side chats on, one more wrapper sets STOAT_HOOK_ROLE=admin: that
-# hook provisions routes for new channels (see hook/ADMIN.md).
+# Multi-channel: with a routes.json, register one hook per route (each with
+# its own queue and worker). `stoatctl routes hooks --write` generates
+# per-route wrappers that set STOAT_ROUTE and source this script; without
+# STOAT_ROUTE this script serves every channel.
 #
 # The Muse hook runtime ($HATCH_HOOK_RUNTIME) provides wake / silent / log.
 # Each run must end in exactly one wake or silent; both exit the script.
@@ -30,7 +28,7 @@ DATA_DIR=${STOAT_DATA_DIR:-$BRIDGE_DIR/data}
 mkdir -p "$DATA_DIR"
 errf="$DATA_DIR/.hook-stderr.$$"
 trap 'rm -f "$errf"' EXIT
-out=$("$PY" "$BRIDGE_DIR/stoatctl.py" hook-poll --role "${STOAT_HOOK_ROLE:-route}" \
+out=$("$PY" "$BRIDGE_DIR/stoatctl.py" hook-poll \
   --window "${STOAT_HOOK_WINDOW:-25}" 2>"$errf")
 rc=$?
 err=$(head -c 300 "$errf"); rm -f "$errf"

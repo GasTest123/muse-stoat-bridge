@@ -92,4 +92,4 @@ if [ -e "$DIR" ]; then echo "could not fully remove $DIR" >&2; exit 1; fi
 echo "removed $DIR"
 
 [ $fail -eq 0 ] || { echo "some paths need manual removal (see above)" >&2; exit 1; }
-echo "muse-stoat-bridge is uninstalled. Side chats in Muse are conversations, not files: keep or delete them as you like."
+echo "muse-stoat-bridge is uninstalled."

@@ -71,7 +71,7 @@ class Config:
         self.autostart = (get("STOAT_AUTOSTART") or "0").strip().lower() in ("1", "true", "yes")
         self.backfill_max_age = int(get("STOAT_BACKFILL_MAX_AGE_SECS") or 3 * 86400)
         self.data_dir = os.path.abspath(get("STOAT_DATA_DIR") or os.path.join(BASE, "data"))
-        # Channel -> route (Muse side chat) mapping, see routes.py.
+        # Channel -> route (one Muse hook each) mapping, see routes.py.
         self.routes_file = os.path.abspath(get("STOAT_ROUTES_FILE")
                                            or os.path.join(BASE, "routes.json"))
         # Where `stoatctl routes hooks --write` puts per-route hook scripts.

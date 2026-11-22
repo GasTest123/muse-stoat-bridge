@@ -45,15 +45,20 @@
 3. **问用户监听范围**：只响应私信和 @（默认），还是某些频道 / 整个服务器里的每条消息都回
    （`.env` 的 `STOAT_LISTEN_CHANNELS`，写法见 `.env.example`）。改了要 `bridge stop` 再 `bridge start`。
 
-4. **注册 hook**（推荐 auto 模式：每个新频道自动开自己的 side chat）：
+4. **注册 hook**。worker 的输出进你的主聊天，不使用 side chat。
 
-   ```bash
-   cd ~/workspace/muse-stoat-bridge && .venv/bin/python stoatctl.py routes auto --mode auto && .venv/bin/python stoatctl.py routes hooks --write
-   ```
+   - 默认：注册一个 hook 处理所有频道，字段取自 `~/workspace/muse-stoat-bridge/hook/hook.example.json`
+     （`script_path` 换成绝对路径 `~/workspace/muse-stoat-bridge/hook/stoat-watch.sh`）。
+   - 用户希望不同频道各有自己的 worker（并行、互相隔离）时，先按频道建路由再生成 hook：
 
-   然后把 `~/workspace/muse-stoat-bridge/hook/routes/hooks.json` 里的每一项用 `hooks.add` 登记：
-   `script_path`、`poll_interval_secs`、`script_timeout_secs` 照抄，instructions 用
-   `instructions_file` 指向的文件全文，投递到 `deliver_to` 指定的 side chat。
+     ```bash
+     cd ~/workspace/muse-stoat-bridge && .venv/bin/python stoatctl.py routes add-each && .venv/bin/python stoatctl.py routes hooks --write
+     ```
+
+     然后把 `~/workspace/muse-stoat-bridge/hook/routes/hooks.json` 里的每一项用 `hooks.add` 登记。
+
+   登记时 `script_path`、`poll_interval_secs`、`script_timeout_secs` 照抄，instructions 用
+   `instructions_file` 指向的文件全文。
 
 5. **验收**：
    - 每个 hook 跑一次 `hooks.dry_run`，结果是 `silent: no new messages`；
@@ -75,7 +80,6 @@
 
 2. **先删 Muse 里的 hook**：`hooks.list`，对每个 `script_path` 以 `~/workspace/muse-stoat-bridge/`（展开后的
    绝对路径）开头的 hook 调用 `hooks.remove`。计划里列出的 id 只是参考，以路径为准。
-   auto 模式后来自动加的 hook 也在其中。
 
 3. **执行卸载**：
 
@@ -89,7 +93,6 @@
 4. **核对**：`~/workspace/muse-stoat-bridge` 不存在了；`~/workspace/custom-skills/stoat-media`
    也不存在了；`hooks.list` 里没有指向它的 hook。
 
-5. 告诉用户卸载完成。这些 hook 当初投递的 side chat 是 Muse 里的对话记录，不是文件，是否删除
-   由用户决定。如果 bot 不再使用，可以在 Stoat 的 Settings → My Bots 里删除它，token 随之作废。
+5. 告诉用户卸载完成。如果 bot 不再使用，可以在 Stoat 的 Settings → My Bots 里删除它，token 随之作废。
 
 `~/workspace/muse-stoat-bridge` 已经不存在、却还有指向它的 hook 时，直接用 `hooks.remove` 删掉这些 hook 即可。

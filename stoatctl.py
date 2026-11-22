@@ -2,7 +2,7 @@
 """stoatctl: the command-line surface the Muse hooks and workers use.
 
 Routing: every Stoat channel resolves to a route (src/routes.py), and every
-route is one Muse hook delivering to one Muse side chat. `--route NAME`
+route is one Muse hook with its own queue and worker. `--route NAME`
 (or STOAT_ROUTE) scopes a command to that route: the queue, worker lease,
 wake state and hook lock are all per route, and a worker cannot touch
 messages or channels of another route. Without --route a command sees
@@ -19,15 +19,12 @@ knows someone is on duty and does not wake a second worker):
   lease [--release]
   warm-wait [--idle S] [--total S]      prints NEW_MESSAGES | IDLE_TIMEOUT | TOTAL_CAP
 Hook command:
-  hook-poll [--window S] [--role route|admin]
-                                        TSV line: wake|silent <TAB> reason <TAB> payload;
-                                        the admin role provisions per-channel side chats;
+  hook-poll [--window S]                TSV line: wake|silent <TAB> reason <TAB> payload;
                                         with STOAT_AUTOSTART=1 it also starts a stopped bridge
 Operator commands (humans, from the main chat or a terminal):
   status | sends | release <key> --confirm-not-sent | compact | whoami
   bridge start|stop|status              run bridge.py detached (log: <data>/bridge.log)
   routes list | discover | add NAME SELECTOR... | add-each | remove NAME | hooks [--write]
-         auto [--mode auto|off ...] | activate NAME | fail NAME --reason R
 
 Exit codes for send / no-reply are documented in src/delivery.py; 4 is also
 returned when a message or channel belongs to another route.
@@ -49,7 +46,7 @@ import ulidutil  # noqa: E402
 from config import Config  # noqa: E402
 from delivery import FAIL_CLOSED, Delivery, bot_identity  # noqa: E402
 from inbox_store import Inbox  # noqa: E402
-from routes import (AWAITING, RouteError, Routes, hook_definitions,  # noqa: E402
+from routes import (RouteError, Routes, hook_definitions,  # noqa: E402
                     load_directory, locked_routes, suggested_name)
 from send_state import SendState, StateCorruptError  # noqa: E402
 from stoat_api import StoatAPI  # noqa: E402
@@ -60,8 +57,6 @@ LEASE_WARM_TTL = 45
 # generation) keeps its busy lease without heartbeats for up to this long.
 LEASE_MAX_HOLD = 1800
 WAKE_COOLDOWN = 240
-PROVISION_RETRY_AFTER = 180  # re-announce a pending route the admin has not registered
-PROVISION_ANNOUNCE_MAX = 2
 MAX_WAKES_PER_MESSAGE = 3
 BRIDGE_STALE = 60
 BRIDGE_ALERT_AFTER = 120
@@ -435,53 +430,29 @@ def _route_payload(ctx):
     if not ctx.route:
         return {}
     info = ctx.routes.info(ctx.route)
-    out = {"route": ctx.route, "side_chat": info["side_chat"]}
+    out = {"route": ctx.route}
     if info.get("notes"):
         out["route_notes"] = info["notes"]
     return out
 
 
 def _unrouted(ctx, channels, by_id, eligible, directory):
-    """Channels that reached the catch-all only as a fallback, with the reason,
-    so the worker can tell a human how to give them their own side chat."""
+    """Channels that reached the catch-all only as a fallback, so the worker can
+    tell a human how to give them a route (and a worker) of their own."""
     out = []
     for cid, c in channels.items():
         rec = next(by_id[i] for i in eligible if by_id[i]["channel"] == cid)
         found = ctx.routes.candidates(cid, rec.get("channel_type"), rec.get("server"))
         hint = suggested_name(directory.get(cid) or c, cid)
         if not found:
-            reason = ("auto side chats are off for this channel type / server, "
-                      "or the auto caps are reached"
-                      if ctx.routes.auto["mode"] == "auto" else "no route matches")
-            out.append({"channel": cid, "name": c["name"], "reason": reason,
+            out.append({"channel": cid, "name": c["name"], "reason": "no route matches",
                         "suggest": f"stoatctl routes add {hint} {cid}"})
-        elif any(ctx.routes.status(n) == "failed" for n in found):
-            name = next(n for n in found if ctx.routes.status(n) == "failed")
-            out.append({"channel": cid, "name": c["name"], "route": name,
-                        "reason": ctx.routes.routes[name].get("failed_reason"),
-                        "suggest": f"register hook stoat-{name} in Muse "
-                                   f"(it activates on its first run)"})
     return out
-
-
-def _activate_on_first_run(ctx):
-    """A route hook that runs proves Muse registered it: pending -> active.
-    A late registration also revives an auto route that timed out."""
-    if not ctx.route or ctx.routes.status(ctx.route) == "active":
-        return
-    with locked_routes(ctx.cfg) as routes:
-        if ctx.route in routes.routes and routes.status(ctx.route) != "active" \
-                and (routes.status(ctx.route) == "pending" or routes.routes[ctx.route].get("auto")):
-            routes.activate(ctx.route)
-    ctx.routes = Routes.load(ctx.cfg)
-    ctx.routes_mtime = _mtime(ctx.cfg.routes_file)
 
 
 def hook_decision(ctx, window, dry_run):
     state_path = ctx._file("hook_state", "json")
     state = read_json(state_path, {})
-    if not dry_run:
-        _activate_on_first_run(ctx)
     now = time.time()
     # Bridge health is reported by one route only, so N channels do not raise N alerts.
     reports_alerts = ctx.route is None or ctx.route == ctx.routes.alerts_route
@@ -492,7 +463,7 @@ def hook_decision(ctx, window, dry_run):
     while decision is None:
         now = time.time()
         # routes.json may change while this run waits (a channel just got its
-        # own side chat); waking on a stale mapping would wake two hooks.
+        # own route); waking on a stale mapping would wake two hooks.
         if _mtime(ctx.cfg.routes_file) != ctx.routes_mtime:
             ctx.routes_mtime = _mtime(ctx.cfg.routes_file)
             ctx.routes = Routes.load(ctx.cfg)
@@ -533,7 +504,7 @@ def hook_decision(ctx, window, dry_run):
                 if stuck:
                     payload["stuck_msg_ids"] = stuck[:10]
                 if ctx.route and ctx.route == ctx.routes.default_route \
-                        and (len(ctx.routes.routes) > 1 or ctx.routes.auto["mode"] == "auto"):
+                        and len(ctx.routes.routes) > 1:
                     unrouted = _unrouted(ctx, channels, by_id, eligible, directory)
                     if unrouted:
                         payload["unrouted"] = unrouted
@@ -557,82 +528,6 @@ def hook_decision(ctx, window, dry_run):
     if not dry_run:
         write_json(state_path, state)
     return decision
-
-
-def _provision(ctx, routes, now):
-    """Fail expired pending routes; create pending routes for AWAITING channels."""
-    timeout = routes.auto["pending_timeout_secs"]
-    failed = []
-    for name in routes.expired_pending(now):
-        routes.fail(name, f"hook not registered in Muse within {timeout}s", now)
-        failed.append(name)
-    directory = load_directory(ctx.cfg)
-    awaiting = {}
-    for rec in ctx.inbox.pending():
-        if routes.route_for_record(rec, now) == AWAITING:
-            awaiting.setdefault(rec["channel"], rec)
-    created = []
-    for cid, rec in awaiting.items():
-        ctype = rec.get("channel_type")
-        if not routes.auto_eligible(ctype, rec.get("server"), now):
-            continue  # a cap was reached part-way through this batch
-        label = (directory.get(cid) or {}).get("name") or rec.get("channel_name")
-        if not label and ctype == "DirectMessage" and rec.get("author_name"):
-            label = f"dm-{rec['author_name']}"
-        label = label or cid[-8:]
-        created.append(routes.provision(cid, label, label, ctype, now))
-    return created, failed
-
-
-def admin_decision(ctx, window, dry_run):
-    """The admin hook: provision per-channel routes and ask the admin worker to
-    register their hooks in Muse."""
-    state_path = ctx.cfg.path("hook_state.admin.json")
-    state = read_json(state_path, {})
-    announced = state.setdefault("announced", {})
-    deadline = time.time() + (0 if dry_run else window)
-    while True:
-        now = time.time()
-        if dry_run:
-            routes = Routes.load(ctx.cfg)
-            created, failed = _provision(ctx, routes, now)
-        else:
-            with locked_routes(ctx.cfg) as routes:
-                created, failed = _provision(ctx, routes, now)
-            if created or failed:
-                hook_definitions(ctx.cfg, routes, write=True)
-        if routes.auto["mode"] != "auto":
-            return "silent", "auto side chats are off", None
-        # Re-announce pending routes the admin worker has not registered yet
-        # (e.g. it crashed before hooks.add), a bounded number of times.
-        retry = [n for n in routes.names()
-                 if routes.status(n) == "pending" and n not in created
-                 and len(announced.get(n, [])) < PROVISION_ANNOUNCE_MAX
-                 and now - max(announced.get(n, [0])) >= PROVISION_RETRY_AFTER]
-        to_register = created + retry
-        if to_register or failed:
-            defs = {d["route"]: d for d in hook_definitions(ctx.cfg, routes)
-                    if d.get("route")}
-            payload = {"ctl": _ctl_command(ctx),
-                       "pending_timeout_secs": routes.auto["pending_timeout_secs"]}
-            if to_register:
-                payload["register"] = [dict(defs[n], channel=routes.routes[n]["match"][0],
-                                            retry=n in retry) for n in to_register]
-            if failed:
-                payload["failed"] = [{"route": n, "side_chat": routes.routes[n]["side_chat"],
-                                      "reason": routes.routes[n].get("failed_reason")}
-                                     for n in failed]
-            if not dry_run:
-                for n in to_register:
-                    announced.setdefault(n, []).append(now)
-                state["announced"] = {n: t for n, t in announced.items()
-                                      if n in routes.routes and routes.status(n) == "pending"}
-                write_json(state_path, state)
-            reason = "provision_routes" if to_register else "routes_provision_failed"
-            return "wake", reason, payload
-        if now >= deadline:
-            return "silent", "nothing to provision", None
-        time.sleep(0.5)
 
 
 # --- bridge process ---------------------------------------------------------------------
@@ -732,21 +627,13 @@ def cmd_bridge(ctx, args):
 
 def cmd_hook_poll(ctx, args):
     dry_run = os.environ.get("HATCH_HOOK_DRY_RUN") == "1"
+    if os.environ.get("STOAT_HOOK_ROLE") == "admin":
+        # The auto side chat admin hook is gone; an old registration must not
+        # turn into an unscoped hook that answers every channel.
+        print("silent\tthe stoat-admin hook is retired: remove it from Muse (hooks.remove)\t")
+        return 0
     if not dry_run:
         ensure_bridge(ctx)
-    role = args.role or os.environ.get("STOAT_HOOK_ROLE") or "route"
-    if role == "admin":
-        lock = open(ctx.cfg.path("hook.admin.lock"), "a+")
-        if not dry_run:
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                print("silent\tprevious admin run still active\t")
-                return 0
-        decision, reason, payload = admin_decision(ctx, args.window, dry_run)
-        print(f"{decision}\t{reason}\t"
-              f"{json.dumps(payload, ensure_ascii=False) if payload else ''}")
-        return 0
     lock = open(ctx._file("hook", "lock"), "a+")
     try:
         # A dry run writes no state, so it may run beside a live run and show
@@ -767,9 +654,7 @@ def cmd_hook_poll(ctx, args):
 def _route_overview(ctx, now):
     out = {}
     for name in ctx.routes.names():
-        out[name] = {"side_chat": ctx.routes.routes[name]["side_chat"],
-                     "status": ctx.routes.status(name),
-                     "pending": len(ctx.pending(name)),
+        out[name] = {"pending": len(ctx.pending(name)),
                      "worker_on_duty": ctx.lease_active(ctx.lease(name), now)}
     return out
 
@@ -799,8 +684,6 @@ def cmd_status(ctx, args):
         "inbox_pending": len(pending),
         "oldest_pending_secs": int(now - pending[0]["received_at"]) if pending else None,
         "routes": _route_overview(ctx, now),
-        "auto": ctx.routes.auto["mode"],
-        "awaiting_side_chat": len(ctx.pending(AWAITING)),
         "sends": send_summary,
         "stuck_msg_ids": sorted(set(stuck)),
     })
@@ -848,7 +731,7 @@ def cmd_routes_list(ctx, args):
     for name in ctx.routes.names():
         route = ctx.routes.routes[name]
         script = os.path.join(ctx.cfg.hooks_dir, f"{name}.sh")
-        emit({"route": name, "side_chat": route["side_chat"], "match": route["match"],
+        emit({"route": name, "match": route["match"],
               "default": name == ctx.routes.default_route,
               "alerts": name == ctx.routes.alerts_route,
               "notes": route.get("notes"), "known_channels": members.get(name, []),
@@ -876,13 +759,13 @@ def cmd_routes_discover(ctx, args):
 def _routes_saved(ctx, changed, hint=None):
     emit({"saved": ctx.cfg.routes_file, "changed": changed,
           "next": hint or "run `stoatctl routes hooks --write`, then register each new hook "
-                          "in Muse with its own side chat"})
+                          "in Muse (instructions: hook/WORKER.md)"})
     return 0
 
 
 def cmd_routes_add(ctx, args):
     with locked_routes(ctx.cfg) as routes:
-        routes.add(args.name, args.selectors, side_chat=args.side_chat, notes=args.notes)
+        routes.add(args.name, args.selectors, notes=args.notes)
     return _routes_saved(ctx, [args.name])
 
 
@@ -902,10 +785,7 @@ def cmd_routes_add_each(ctx, args):
             name, n = suggested_name(info, cid), 2
             while name in routes.routes:
                 name, n = f"{suggested_name(info, cid)}-{n}", n + 1
-            label = info.get("name") or cid[-8:]
-            side_chat = f"{args.prefix}{label}" if ctype == "DirectMessage" \
-                else f"{args.prefix}#{label}"
-            routes.add(name, [cid], side_chat=side_chat)
+            routes.add(name, [cid])
             added.append(name)
     return _routes_saved(ctx, added)
 
@@ -914,45 +794,6 @@ def cmd_routes_remove(ctx, args):
     with locked_routes(ctx.cfg) as routes:
         routes.remove(args.name)
     return _routes_saved(ctx, [args.name], "also remove hook stoat-%s from Muse" % args.name)
-
-
-def cmd_routes_activate(ctx, args):
-    with locked_routes(ctx.cfg) as routes:
-        if args.name not in routes.routes:
-            raise RouteError(f"unknown route {args.name!r}")
-        routes.activate(args.name)
-    return _routes_saved(ctx, [args.name], "its hook must be registered in Muse")
-
-
-def cmd_routes_fail(ctx, args):
-    with locked_routes(ctx.cfg) as routes:
-        if args.name not in routes.routes or args.name == routes.default_route:
-            raise RouteError(f"cannot fail route {args.name!r}")
-        routes.fail(args.name, args.reason)
-    return _routes_saved(ctx, [args.name], "its channel now falls back to the default route")
-
-
-def cmd_routes_auto(ctx, args):
-    """Show or change the auto side chat policy."""
-    with locked_routes(ctx.cfg) as routes:
-        a = routes.auto
-        if args.mode:
-            a["mode"] = args.mode
-        if args.types is not None:
-            a["types"] = [t for t in args.types.split(",") if t]
-        if args.servers is not None:
-            a["servers"] = [t for t in args.servers.split(",") if t]
-        for key in ("max_routes", "max_per_hour", "pending_timeout_secs"):
-            if getattr(args, key) is not None:
-                a[key] = getattr(args, key)
-        if args.admin_side_chat:
-            a["admin_side_chat"] = args.admin_side_chat
-        policy = dict(a)
-    emit({"auto": policy, "routes_file": ctx.cfg.routes_file})
-    if policy["mode"] == "auto":
-        emit({"next": "run `stoatctl routes hooks --write` and register hook stoat-admin "
-                      "(instructions: hook/ADMIN.md) in Muse"}, sys.stderr)
-    return 0
 
 
 def cmd_routes_hooks(ctx, args):
@@ -968,7 +809,7 @@ def build_parser():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--data-dir", help="override STOAT_DATA_DIR")
     p.add_argument("--routes-file", help="override STOAT_ROUTES_FILE")
-    p.add_argument("--route", help="scope to one route / side chat (default: STOAT_ROUTE)")
+    p.add_argument("--route", help="scope to one route (default: STOAT_ROUTE)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("peek")
@@ -1020,8 +861,7 @@ def build_parser():
 
     s = sub.add_parser("hook-poll")
     s.add_argument("--window", type=float, default=25.0)
-    s.add_argument("--role", choices=["route", "admin"],
-                   help="admin = provision per-channel side chats (default: STOAT_HOOK_ROLE)")
+    s.add_argument("--role", choices=["route"], help=argparse.SUPPRESS)  # older wrappers
     s.set_defaults(fn=cmd_hook_poll)
 
     for name, fn in (("status", cmd_status), ("sends", cmd_sends),
@@ -1037,7 +877,7 @@ def build_parser():
     s.add_argument("--confirm-not-sent", action="store_true")
     s.set_defaults(fn=cmd_release)
 
-    routes = sub.add_parser("routes", help="channel -> side chat mapping").add_subparsers(
+    routes = sub.add_parser("routes", help="channel -> route (hook) mapping").add_subparsers(
         dest="routes_cmd", required=True)
     routes.add_parser("list").set_defaults(fn=cmd_routes_list)
     routes.add_parser("discover").set_defaults(fn=cmd_routes_discover)
@@ -1045,33 +885,15 @@ def build_parser():
     s.add_argument("name")
     s.add_argument("selectors", nargs="*",
                    help="channel id | server:<id> | type:<DirectMessage|Group|TextChannel>")
-    s.add_argument("--side-chat")
     s.add_argument("--notes")
     s.set_defaults(fn=cmd_routes_add)
     s = routes.add_parser("add-each", help="one route per known channel not yet routed")
     s.add_argument("--no-dms", dest="dms", action="store_false",
                    help="leave direct messages on the default route")
-    s.add_argument("--prefix", default="Stoat · ", help="side chat name prefix")
     s.set_defaults(fn=cmd_routes_add_each)
     s = routes.add_parser("remove")
     s.add_argument("name")
     s.set_defaults(fn=cmd_routes_remove)
-    s = routes.add_parser("activate", help="mark a route active (its hook is registered)")
-    s.add_argument("name")
-    s.set_defaults(fn=cmd_routes_activate)
-    s = routes.add_parser("fail", help="give up on a route; its channel falls back")
-    s.add_argument("name")
-    s.add_argument("--reason", required=True)
-    s.set_defaults(fn=cmd_routes_fail)
-    s = routes.add_parser("auto", help="show / change the auto side chat policy")
-    s.add_argument("--mode", choices=["off", "auto"])
-    s.add_argument("--types", help="comma list: TextChannel,Group,DirectMessage")
-    s.add_argument("--servers", help="comma list of server ids ('' = any)")
-    s.add_argument("--max-routes", dest="max_routes", type=int)
-    s.add_argument("--max-per-hour", dest="max_per_hour", type=int)
-    s.add_argument("--timeout", dest="pending_timeout_secs", type=int)
-    s.add_argument("--admin-side-chat")
-    s.set_defaults(fn=cmd_routes_auto)
     s = routes.add_parser("hooks", help="Muse hook definitions, one per route")
     s.add_argument("--write", action="store_true", help="also write hook scripts + hooks.json")
     s.add_argument("--poll", type=int, default=5)

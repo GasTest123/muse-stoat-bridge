@@ -3,15 +3,13 @@
 把 [Stoat](https://stoat.chat)（原 Revolt，开源的 Slack / Discord 替代品）接到 Muse：用户在
 Stoat 里私信 bot、@ 它，或者回复它发过的消息，Muse 就会被唤醒，读取上下文后回复。
 
-**多频道**：每个 Stoat 频道可以对应 Muse 里一个独立的 side chat。每条路由有自己的 hook、
-worker、租约和唤醒状态，所以不同频道可以同时处理，彼此的上下文互不相通。
+**多频道**：频道按 `routes.json` 分成多条路由，每条路由在 Muse 里有自己的 hook、worker、
+租约和唤醒状态，所以不同频道可以同时处理，彼此的消息互不可见。worker 的输出都进 Muse 的
+主聊天；bridge 不创建、也不写入 Muse 的 side chat（实测 hook 无法写入 side chat）。
 
 **图片 / 视频**：worker 可以把生成的图片、视频作为附件发回频道（`stoatctl send --attach`，
 走 Stoat 的文件服务 Autumn）。完整的“生成 → 整理格式和大小 → 发送”流程做成了独立的
 **stoat-media skill**（`skills/stoat-media/`），部署 Muse 时可以选择安装（§4.4）。
-
-**自动开 side chat**：打开 auto 模式后，新频道第一次 @ bot 或私信 bot 时，会自动获得自己的
-side chat，第一条消息也在这个新 side chat 里回复。也可以保持手动，由人决定哪些频道单独开。
 
 工作方式：**常驻桥只负责接收 → 写入持久收件箱 → Muse hook 唤醒 worker → worker 通过持久
 发送管线回复**。
@@ -46,14 +44,14 @@ Stoat ──Bonfire WebSocket（推送，毫秒级）──> bridge.py（常驻�
                        ▼
           data/inbox.jsonl（追加写 + fsync + 完成标记 tombstone）
                        │
-          routes.json：频道 → 路由（route）→ Muse side chat
+          routes.json：频道 → 路由（route）→ Muse hook
                        │
    ┌───────────────────┼────────────────────┬──────────────────────┐
    ▼                   ▼                    ▼                      ▼
 hook stoat-general   hook stoat-dm-alice   hook stoat-random    hook stoat-inbox（兜底）
    │（各自每 ~5s 被调度一次，每次最多盯 25s；有消息立即 wake）
    ▼                   ▼                    ▼                      ▼
-side chat #general   side chat dm-alice    side chat #random    side chat 收件箱
+worker（每条路由各一个，可并行；输出进 Muse 主聊天）
    worker：stoatctl --route X peek → history → 决定回复 → send / no-reply → warm-wait
                        ▼
 stoatctl send ──POST /channels/{id}/messages（带 Idempotency-Key）──> Stoat
@@ -81,7 +79,7 @@ muse-stoat-bridge/
 │  ── 实现：入口程序引用的模块，不直接运行 ──
 ├── src/
 │   ├── config.py        配置：.env / 环境变量，数据目录等路径（以项目根目录为基准）
-│   ├── routes.py        频道 → 路由 → side chat 的映射，以及按路由生成 hook
+│   ├── routes.py        频道 → 路由的映射，以及按路由生成 hook
 │   ├── delivery.py      持久发送状态机 + 退出码定义
 │   ├── filters.py       哪些消息要入队（纯函数）
 │   ├── inbox_store.py   收件箱队列
@@ -94,7 +92,6 @@ muse-stoat-bridge/
 ├── hook/
 │   ├── stoat-watch.sh   ★ Muse hook 脚本（按 STOAT_ROUTE 只处理一条路由）
 │   ├── WORKER.md        ★ hook 指令：worker 被唤醒后怎么做（交给 Muse 的约定）
-│   ├── ADMIN.md         ★ admin hook 指令：为新频道注册 hook、开 side chat（auto 模式）
 │   ├── hook.example.json    单路由模式的 hook 定义示例
 │   └── routes/          `stoatctl routes hooks --write` 生成的每条路由一个 hook（不入库）
 ├── skills/
@@ -222,13 +219,8 @@ cd ~/workspace/muse-stoat-bridge && .venv/bin/python stoatctl.py status
 
 ### 4.3 配置路由并注册 Muse hook
 
-有两种做法，详细说明见 §5：
-
-- **自动（推荐）**：开启 auto 模式，只注册 `stoat-admin` 和 `stoat-inbox` 两个 hook，之后
-  每个频道第一次和 bot 说话时，会自动注册自己的 hook、开出自己的 side chat（§5.4）。
-- **手动**：按下面的步骤一次性给已知频道建好路由，以后有新频道再手动添加。
-
-手动做法的最短流程：
+最简单的做法是不建 routes.json：只注册一个 hook（`hook/hook.example.json`），所有频道都由它
+处理。想让不同频道各有自己的 worker（并行处理、互相隔离），就按频道建路由，详细说明见 §5：
 
 ```bash
 uv run stoatctl.py routes discover        # 列出 bridge 看到的频道，以及每个频道当前去哪条路由
@@ -249,12 +241,12 @@ uv run stoatctl.py routes hooks --write   # 每条路由生成一个 hook 脚本
 | script | `hook/routes/<route>.sh`（生成的包装脚本，已设好 `STOAT_ROUTE`） |
 | poll_interval_secs / script_timeout_secs | 5 / 60（`script_timeout_secs` 必须大于 `STOAT_HOOK_WINDOW` 再加 30） |
 | instructions | `hook/WORKER.md` 全文 |
-| 投递位置 | `deliver_to` 里写的那个 side chat，每条路由各用一个 |
+| 投递位置 | 不用设置：worker 的输出进 Muse 主聊天 |
 
 验收步骤：
 
 1. 每个 hook 都运行一次 `hooks.dry_run`，返回结果应为 `silent: no new messages`。
-2. 在不同频道各发一条消息，确认每个 side chat 只处理自己频道的消息，并且回复挂在原消息下。
+2. 在不同频道各发一条消息，确认每个 hook 只处理自己路由的消息，并且回复挂在原消息下。
 3. `uv run stoatctl.py status` 显示每条路由的 `pending` 都是 0，`sends: {}`。
 
 > 关于 Muse hook 运行时：`wake` / `silent` / `HATCH_HOOK_RESULT` 的行为来自第三方逆向资料，
@@ -310,12 +302,11 @@ hook，并列出这次安装用到的 id）、安装列表里的目录外路径�
 | 代码、`.venv`、`.uv`、`.env`、`data/`、日志、`routes.json`、`hook/routes/`、安装列表 | `~/workspace/muse-stoat-bridge/` | 整个目录删除 |
 | stoat-media skill（软链接） | `~/workspace/custom-skills/stoat-media` | 按安装列表删除链接 |
 | Muse hook | Muse 里的登记，不是文件 | 先用 `hooks.remove` 删除 |
-| side chat | Muse 里的对话记录，不是文件 | 由用户决定是否删除 |
 
 bridge 运行时不会往项目目录以外写文件：hook 脚本的临时输出在 `data/` 下，媒体文件在
 `data/media/` 下，uv 的缓存和 Python 在 `.uv/` 下。
 
-## 5. 多频道：频道 ↔ side chat
+## 5. 多频道：频道 ↔ 路由
 
 ### 5.1 routes.json
 
@@ -326,11 +317,10 @@ bridge 运行时不会往项目目录以外写文件：hook 脚本的临时输�
   "default_route": "inbox",
   "alerts_route": "inbox",
   "routes": {
-    "inbox":   {"side_chat": "Stoat · 收件箱", "notes": "兜底：没有专属 side chat 的频道"},
-    "general": {"side_chat": "Stoat · #general", "match": ["01J...频道ID"],
-                "notes": "工程讨论频道，回复要技术化"},
-    "dms":     {"side_chat": "Stoat · 私信", "match": ["type:DirectMessage"]},
-    "team-x":  {"side_chat": "Stoat · Team X", "match": ["server:01J...服务器ID"]}
+    "inbox":   {"notes": "兜底：没有专属路由的频道"},
+    "general": {"match": ["01J...频道ID"], "notes": "工程讨论频道，回复要技术化"},
+    "dms":     {"match": ["type:DirectMessage"]},
+    "team-x":  {"match": ["server:01J...服务器ID"]}
   }
 }
 ```
@@ -340,10 +330,12 @@ bridge 运行时不会往项目目录以外写文件：hook 脚本的临时输�
 - 一条消息归属哪条路由，按以下顺序查找，命中即停：频道 ID → 服务器 → 频道类型 →
   `default_route`。因此每条消息恰好落到一条路由，不会被丢弃。
 - 同一个选择器只能属于一条路由，冲突时会直接报错。
-- `notes` 会作为 `route_notes` 放进唤醒载荷，用来给这个 side chat 定制回复风格。
+- `notes` 会作为 `route_notes` 放进唤醒载荷，用来给这条路由定制回复风格。
 - `alerts_route`：只有这一条路由会收到 `bridge_down` / `bridge_recovered` 告警，避免 N 个频道
   重复报警。
-- 没有 routes.json 时只有一条 `default` 路由，即单 hook、单 side chat 的原始模式。
+- 没有 routes.json 时只有一条 `default` 路由，即单 hook 模式。
+- 旧版本写下的 `side_chat`、`auto`、`status` 等字段会被忽略，下次保存时去掉；当时已放弃
+  （`failed`）的路由视为不存在，它的频道回到兜底路由。
 - 路由是在**消费时**解析的。修改 routes.json 后不需要重启 bridge，已经排队的消息也会按新
   映射处理；正在等待中的 hook 运行检测到文件变化后会重新加载，不会出现两个 hook 同时被唤醒。
 
@@ -363,81 +355,23 @@ bridge 运行时不会往项目目录以外写文件：hook 脚本的临时输�
 
 1. bridge 收到 `ChannelCreate`，或启动时读到新频道，会更新频道目录。
 2. 新频道的消息先进入**兜底路由**（收件箱）。那里的 worker 正常回复，并在载荷的 `unrouted`
-   字段里看到“这个频道还没有专属 side chat”，于是在收件箱 side chat 里附上建议命令，例如
+   字段里看到“这个频道还没有专属路由”，于是在本回合的输出里附上建议命令，例如
    `stoatctl routes add dev <id>`。
-3. 主人决定给它单独开 side chat 时，依次执行：
+3. 主人决定给它单独建路由时，依次执行：
 
 ```bash
-uv run stoatctl.py routes add dev <channel_id> --side-chat "Stoat · #dev" --notes "研发频道"
+uv run stoatctl.py routes add dev <channel_id> --notes "研发频道"
 ```
 
 ```bash
 uv run stoatctl.py routes hooks --write
 ```
 
-   然后在 Muse 里注册新生成的 `hook/routes/dev.sh`。从下一条消息开始，#dev 就进入自己的
-   side chat。
-
-auto 模式下这一步会自动完成，见 §5.4。
+   然后在 Muse 里注册新生成的 `hook/routes/dev.sh`。从下一条消息开始，#dev 就由自己的
+   hook 和 worker 处理。新路由的 hook 永远由人注册，worker 不会自己注册 hook。
 
 其他路由命令：`routes remove <name>`（该路由的频道回到兜底路由）、`routes list`、
 `routes discover`。
-
-### 5.4 自动开 side chat（auto 模式）
-
-开启方法：
-
-```bash
-uv run stoatctl.py routes auto --mode auto --types TextChannel,Group --max-routes 20 --max-per-hour 5
-```
-
-```bash
-uv run stoatctl.py routes hooks --write
-```
-
-然后在 Muse 里**只注册两个 hook**：`stoat-admin`（指令 `hook/ADMIN.md`，投递到「Stoat · 管理」）
-和 `stoat-inbox`（指令 `hook/WORKER.md`）。之后的 hook 都由 admin worker 自动注册。
-
-流程：
-
-```
-新频道第一次 @ bot / 私信 bot
-  → 该频道符合策略？
-      否 → 交给收件箱处理（载荷 unrouted 里说明原因）
-      是 → 消息被扣住（状态 AWAITING，收件箱看不到它）
-           → stoat-admin hook-poll：在 routes.json 里建一条 pending 路由，生成 hook 脚本，
-             wake provision_routes
-           → admin worker：用 Muse 的 hooks.list 确认不存在，再调用 hooks.add
-             （脚本、ADMIN/WORKER 指令全文、投递到新的 side chat）
-           → 新 hook 第一次运行：pending → active，处理被扣住的消息
-```
-
-`routes.json` 里的 `auto` 配置项（用 `routes auto` 命令修改）：
-
-| 字段 | 默认值 | 含义 |
-|---|---|---|
-| `mode` | `off` | `auto` 开启 |
-| `types` | `["TextChannel","Group"]` | 哪些频道类型会自动开；加上 `DirectMessage` 后，每个私信用户也各开一个 |
-| `servers` | `[]` | 只对这些服务器生效；空表示任何服务器 |
-| `max_routes` | 20 | 自动创建且仍有效的路由上限；达到上限后，新频道交给收件箱 |
-| `max_per_hour` | 5 | 每小时最多新开几个 |
-| `pending_timeout_secs` | 600 | 新 hook 必须在这段时间内被注册，否则路由记为 `failed` |
-| `admin_side_chat` / `side_chat_prefix` | `Stoat · 管理` / `Stoat · ` | 命名 |
-
-安全与失败处理：
-
-- **只在频道真的和 bot 说话时才创建**：单纯建一个频道不会占用 hook。
-- **注册新 hook 是 admin 的专职**：处理 Stoat 消息的 worker 不负责注册 hook。admin worker
-  也只注册载荷里列出的 hook，不改动其他 hook，也不改 `routes.json`。
-- **以“首次运行”作为注册成功的证据**：只有 hook 真的被 Muse 跑起来，路由才会变成 `active`。
-- **超时或失败都会退回收件箱**：
-  - `hooks.add` 失败时，admin 执行 `routes fail`；
-  - 超时后路由自动变为 `failed`；
-  - 被扣住的消息都改由收件箱回复，不会丢；
-  - 没注册 admin hook 时，AWAITING 状态的消息超时后同样退回收件箱。
-- **之后补注册也能生效**：`failed` 的自动路由，只要它的 hook 后来被注册并运行，就会重新激活。
-- **有限次重试**：admin 通知后 3 分钟内还没注册，会再提醒一次，最多两次。
-- 想停止自动创建：执行 `routes auto --mode off`。已经建好的路由不受影响。
 
 ## 6. 延迟
 
@@ -489,9 +423,7 @@ worker 调用以下任一命令都会刷新**本路由**的租约。
 | 命令 | 作用 |
 |---|---|
 | `status` | 健康状况、各路由的积压和租约、发送状态、stuck 消息 |
-| `routes list / discover / add / add-each / remove / hooks [--write]` | 管理频道到 side chat 的映射（§5） |
-| `routes auto [--mode auto\|off] [--types …] [--servers …] [--max-routes N] [--max-per-hour N] [--timeout S]` | 查看或修改自动开 side chat 的策略（§5.4） |
-| `routes activate <name>` / `routes fail <name> --reason R` | 手动激活路由 / 放弃路由，让该频道退回收件箱 |
+| `routes list / discover / add / add-each / remove / hooks [--write]` | 管理频道到路由的映射（§5） |
 | `sends` | 列出未完成的发送尝试 |
 | `release <key> --confirm-not-sent` | 在 Stoat 里**亲眼确认消息不存在**之后，释放一条 `uncertain` 的发送尝试 |
 | `compact` | 压缩收件箱（bridge 每 6 小时也会自动做一次） |
@@ -542,7 +474,6 @@ uv run python -m unittest discover -s tests
   bridge（dry run 不会），以及在假的 home 里离线跑真实的 `install.sh` / `uninstall.sh`：skill 是软链接、
   重复安装不重复登记、卸载计划不删东西、`--yes` 停掉 bridge 并删掉项目目录和 skill 链接（不碰链接
   指向的文件）、安装列表和目录不符时拒绝卸载。
-- `test_auto_routes`：自动开 side chat 的策略、admin hook 的登记载荷和各种失败路径。
 
 **真实服务器测试**（可选，使用 `.env` 里的 token 和服务器）：
 
@@ -570,7 +501,7 @@ bot 会短暂显示在线。
 | 发了“正在生成”之后就没有下文 | worker 在生成途中退出了。`--part 1/2` 发出后，源消息还没完成，下次唤醒会重新处理它。生成很慢时要先 `lease --hold`，否则超过 2 分钟没心跳，hook 会再起一个 worker。 |
 | 日志里连汇总行都没有 | bridge 根本没收到事件。看启动日志里 `ready: N channels`：如果目标频道不在其中，说明 bot 没加入那个服务器，或者没有 View Channel 权限。 |
 | 想看每条消息被过滤的原因 | 启动时加 `STOAT_LOG_LEVEL=DEBUG`，每条被忽略的消息都会打一行 `ignored <channel>:<id> … (<原因>)`。 |
-| 消息进了队列但没有回复 | 这一步和 bridge 无关，是 Muse 侧的问题。检查 hook 是否在运行（`status` 里各路由的 `pending`，`hooks.dry_run`）。auto 模式下，`awaiting_side_chat` 大于 0 说明在等 admin hook 注册新的 hook。 |
+| 消息进了队列但没有回复 | 这一步和 bridge 无关，是 Muse 侧的问题。检查 hook 是否在运行（`status` 里各路由的 `pending`，`hooks.dry_run`）。 |
 
 ## 11. 已知限制与待验证项
 
@@ -587,11 +518,10 @@ bot 会短暂显示在线。
 - **需要用真实账号验证**：
   - 用户能否直接私信 bot；
   - bot 是否真的能收到服务器内所有频道的事件；
-  - Muse 是否支持“每个 hook 投递到不同的 side chat”，以及 hook worker 能否看到该 side chat
-    的历史；
-  - auto 模式下，hook worker 能否调用 `hooks.add`、能否新建 side chat，以及 Muse 的 hook
-    数量配额是多少。
-- 关闭 auto 模式时，新路由需要人工在 Muse 里注册对应的 hook；处理消息的 worker 永远不会自己注册 hook。
+  - Muse 的 hook 数量配额是多少（每条路由占一个 hook）。
+- 已在 Muse 正式环境确认：hook 无法把内容写入 side chat，所以 bridge 不使用 side chat，
+  所有 worker 输出都进主聊天。
+- 新路由需要人工在 Muse 里注册对应的 hook；处理消息的 worker 永远不会自己注册 hook。
 - 频道被删除后，它的路由和 hook 不会自动清理（`routes remove` + Muse `hooks.remove`）。
 - 用户发来的附件只把元数据和下载 URL 交给 worker，bridge 不会替它下载内容。
 - `STOAT_PROXY_URL` 只对 REST 生效，WebSocket 走直连（可以配置 `STOAT_CA_BUNDLE`）。

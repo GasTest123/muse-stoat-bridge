@@ -1,9 +1,8 @@
 {
-  "_comment": "Single-route hook (all channels -> one side chat). For one side chat per channel use `stoatctl routes hooks --write` instead. The real Muse `hooks.add` schema is not public; map these fields onto it.",
+  "_comment": "Single-route hook: every channel goes to one hook. For one hook (own queue and worker) per channel group, use `stoatctl routes hooks --write` instead. The real Muse `hooks.add` schema is not public; map these fields onto it.",
   "id": "stoat-watch",
   "script_path": "hook/stoat-watch.sh",
   "poll_interval_secs": 5,
   "script_timeout_secs": 60,
-  "instructions_file": "hook/WORKER.md",
-  "deliver_to": "side_chat:stoat"
+  "instructions_file": "hook/WORKER.md"
 }
